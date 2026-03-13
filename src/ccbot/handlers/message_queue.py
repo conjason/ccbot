@@ -124,6 +124,21 @@ _last_text_msg: dict[tuple[int, int, str], tuple[list[int], str]] = {}
 _CONSOLIDATION_TIMEOUT = 120.0  # seconds
 
 
+def clear_consolidation_state(
+    user_id: int, thread_id: int | None, window_id: str
+) -> None:
+    """Clear consolidation state for a conversation turn boundary.
+
+    Called when the user sends a new message, ensuring the previous turn's
+    final answer is never folded into the next turn's process message.
+    """
+    tid = thread_id or 0
+    ikey = (user_id, tid, window_id)
+    _consolidation_state.pop(ikey, None)
+    _last_text_msg.pop(ikey, None)
+    _intermediate_msgs.pop(ikey, None)
+
+
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
     return _message_queues.get(user_id)

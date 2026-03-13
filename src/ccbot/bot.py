@@ -113,6 +113,7 @@ from .handlers.interactive_ui import (
     set_interactive_mode,
 )
 from .handlers.message_queue import (
+    clear_consolidation_state,
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_status_update,
@@ -949,6 +950,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.chat.send_action(ChatAction.TYPING)
     await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
+
+    # Clear consolidation state — new user message = new turn boundary.
+    # Prevents the previous turn's final answer from being folded.
+    clear_consolidation_state(user.id, thread_id, wid)
 
     # Cancel any running bash capture — new message pushes pane content down
     _cancel_bash_capture(user.id, thread_id)
