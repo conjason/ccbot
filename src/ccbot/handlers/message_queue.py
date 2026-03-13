@@ -84,6 +84,21 @@ _flood_until: dict[int, float] = {}
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
 
+# --- Retroactive consolidation of intermediate messages ---
+# Intermediate content types (tool calls, thinking, etc.)
+_INTERMEDIATE_CONTENT_TYPES = {"tool_result", "thinking", "local_command"}
+
+# Expandable quote sentinels (must match TranscriptParser constants)
+_EQ_START = "\x02EXPQUOTE_START\x02"
+_EQ_END = "\x02EXPQUOTE_END\x02"
+
+# Track intermediate messages for retroactive consolidation when final text arrives.
+# Key: (user_id, thread_id_or_0, window_id)
+# Value: list of (list[telegram_message_id], raw_text_before_markdown)
+_intermediate_msgs: dict[
+    tuple[int, int, str], list[tuple[list[int], str]]
+] = {}
+
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
@@ -125,6 +140,12 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     # tool_use breaks merge chain (needs message_id tracking for editing)
     if base.content_type == "tool_use" or candidate.content_type == "tool_use":
+        return False
+    # Don't merge text with intermediate types — text triggers consolidation
+    # of preceding intermediates, so they must stay in separate tasks.
+    base_is_intermediate = base.content_type in _INTERMEDIATE_CONTENT_TYPES
+    cand_is_intermediate = candidate.content_type in _INTERMEDIATE_CONTENT_TYPES
+    if base_is_intermediate != cand_is_intermediate:
         return False
     return True
 
@@ -293,11 +314,82 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
     )
 
 
+async def _consolidate_intermediate_msgs(
+    bot: Bot, user_id: int, tid: int, wid: str, chat_id: int
+) -> None:
+    """Retroactively consolidate intermediate messages into one collapsed block.
+
+    Called when a final text message arrives. Edits the first intermediate
+    message with all combined content (as a single expandable quote) and
+    deletes all other intermediate messages.
+    """
+    ikey = (user_id, tid, wid)
+    intermediates = _intermediate_msgs.pop(ikey, None)
+    if not intermediates:
+        return
+
+    # Collect all message IDs and raw texts
+    all_msg_ids: list[int] = []
+    combined_parts: list[str] = []
+    for msg_ids, raw_text in intermediates:
+        all_msg_ids.extend(msg_ids)
+        # Strip existing expandable quote markers to avoid nesting
+        stripped = raw_text.replace(_EQ_START, "").replace(_EQ_END, "")
+        stripped = stripped.strip()
+        if stripped:
+            combined_parts.append(stripped)
+
+    if not all_msg_ids or not combined_parts:
+        return
+
+    # Wrap all combined content in a single expandable quote
+    combined_text = _EQ_START + "\n\n".join(combined_parts) + _EQ_END
+
+    # Edit the first message with the combined collapsed content
+    first_msg_id = all_msg_ids[0]
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=first_msg_id,
+            text=_ensure_formatted(combined_text),
+            parse_mode=PARSE_MODE,
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+    except RetryAfter:
+        raise
+    except Exception:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=first_msg_id,
+                text=strip_sentinels(combined_text),
+                link_preview_options=NO_LINK_PREVIEW,
+            )
+        except RetryAfter:
+            raise
+        except Exception as e:
+            logger.debug(f"Failed to consolidate intermediate msgs: {e}")
+            return  # Leave messages as-is on failure
+
+    # Delete all other intermediate messages
+    for msg_id in all_msg_ids[1:]:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except RetryAfter:
+            raise
+        except Exception as e:
+            logger.debug(f"Failed to delete intermediate msg {msg_id}: {e}")
+
+
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Process a content message task."""
     wid = task.window_id or ""
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+
+    # 0. If this is a final text message, consolidate preceding intermediates
+    if task.content_type == "text":
+        await _consolidate_intermediate_msgs(bot, user_id, tid, wid, chat_id)
 
     # 1. Handle tool_result editing (merged parts are edited together)
     if task.content_type == "tool_result" and task.tool_use_id:
@@ -343,6 +435,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 2. Send content messages, converting status message to first content part
     first_part = True
     last_msg_id: int | None = None
+    sent_ids: list[int] = []  # Track all sent msg IDs for intermediate tracking
     for part in task.parts:
         sent = None
 
@@ -358,6 +451,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                sent_ids.append(converted_msg_id)
                 continue
 
         sent = await send_with_fallback(
@@ -369,6 +463,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
         if sent:
             last_msg_id = sent.message_id
+            sent_ids.append(sent.message_id)
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
@@ -377,7 +472,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
 
-    # 5. After content, check and send status
+    # 5. Track intermediate messages for retroactive consolidation
+    if task.content_type in _INTERMEDIATE_CONTENT_TYPES and sent_ids:
+        ikey = (user_id, tid, wid)
+        if ikey not in _intermediate_msgs:
+            _intermediate_msgs[ikey] = []
+        raw_text = "\n\n".join(task.parts)
+        _intermediate_msgs[ikey].append((sent_ids, raw_text))
+
+    # 6. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 
