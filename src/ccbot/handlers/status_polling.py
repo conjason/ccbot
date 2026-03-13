@@ -165,11 +165,29 @@ async def status_poll_loop(bot: Bot) -> None:
                             e,
                         )
 
+            # When the tmux session itself is gone (e.g. tmux kill-server),
+            # don't clean up bindings — they'll be restored on next startup.
+            tmux_session_alive = tmux_manager.get_session() is not None
+
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        if not tmux_session_alive:
+                            logger.info(
+                                "Skipping stale cleanup (tmux session gone): "
+                                "user=%d thread=%d wid=%s",
+                                user_id,
+                                thread_id,
+                                wid,
+                            )
+                            continue
+                        logger.info(
+                            "tmux_session_alive=%s for stale wid=%s",
+                            tmux_session_alive,
+                            wid,
+                        )
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
