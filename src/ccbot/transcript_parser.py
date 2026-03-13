@@ -76,6 +76,9 @@ class TranscriptParser:
     _INTERRUPTED_TEXT = "[Request interrupted by user for tool use]"
     _MAX_SUMMARY_LENGTH = 200
 
+    # Interactive tools that need immediate tool_use emission for UI handling
+    _INTERACTIVE_TOOLS = {"AskUserQuestion", "ExitPlanMode", "Permission"}
+
     @staticmethod
     def parse_line(line: str) -> dict | None:
         """Parse a single JSONL line.
@@ -344,10 +347,18 @@ class TranscriptParser:
         return f"{cls.EXPANDABLE_QUOTE_START}{text}{cls.EXPANDABLE_QUOTE_END}"
 
     @classmethod
-    def _format_tool_result_text(cls, text: str, tool_name: str | None = None) -> str:
+    def _format_tool_result_text(
+        cls, text: str, tool_name: str | None = None, plain: bool = False
+    ) -> str:
         """Format tool result text with statistics summary.
 
         Shows relevant statistics for each tool type, with expandable quote for full content.
+
+        Args:
+            text: The tool result text content
+            tool_name: Name of the tool (for type-specific formatting)
+            plain: If True, return plain text without expandable quote wrappers.
+                   Used when the caller will wrap the entire block in an expandable quote.
 
         No truncation here — per project principles, truncation is handled
         only at the send layer (split_message / _render_expandable_quote).
@@ -356,6 +367,7 @@ class TranscriptParser:
             return ""
 
         line_count = text.count("\n") + 1 if text else 0
+        _quote = (lambda t: t) if plain else cls._format_expandable_quote
 
         # Tool-specific statistics
         if tool_name == "Read":
@@ -371,42 +383,42 @@ class TranscriptParser:
             # Bash: show output line count
             if line_count > 0:
                 stats = f"  ⎿  Output {line_count} lines"
-                return stats + "\n" + cls._format_expandable_quote(text)
-            return cls._format_expandable_quote(text)
+                return stats + "\n" + _quote(text)
+            return _quote(text)
 
         elif tool_name == "Grep":
             # Grep: show match count (count non-empty lines)
             matches = len([line for line in text.split("\n") if line.strip()])
             stats = f"  ⎿  Found {matches} matches"
-            return stats + "\n" + cls._format_expandable_quote(text)
+            return stats + "\n" + _quote(text)
 
         elif tool_name == "Glob":
             # Glob: show file count
             files = len([line for line in text.split("\n") if line.strip()])
             stats = f"  ⎿  Found {files} files"
-            return stats + "\n" + cls._format_expandable_quote(text)
+            return stats + "\n" + _quote(text)
 
         elif tool_name == "Task":
             # Task: show output length
             if line_count > 0:
                 stats = f"  ⎿  Agent output {line_count} lines"
-                return stats + "\n" + cls._format_expandable_quote(text)
-            return cls._format_expandable_quote(text)
+                return stats + "\n" + _quote(text)
+            return _quote(text)
 
         elif tool_name == "WebFetch":
             # WebFetch: show content length
             char_count = len(text)
             stats = f"  ⎿  Fetched {char_count} characters"
-            return stats + "\n" + cls._format_expandable_quote(text)
+            return stats + "\n" + _quote(text)
 
         elif tool_name == "WebSearch":
             # WebSearch: show results count (estimate by sections)
             results = text.count("\n\n") + 1 if text else 0
             stats = f"  ⎿  {results} search results"
-            return stats + "\n" + cls._format_expandable_quote(text)
+            return stats + "\n" + _quote(text)
 
         # Default: expandable quote without stats
-        return cls._format_expandable_quote(text)
+        return _quote(text)
 
     @classmethod
     def parse_entries(
@@ -535,17 +547,21 @@ class TranscriptParser:
                                 tool_name=name,
                                 input_data=input_data,
                             )
-                            # Also emit tool_use entry with tool_name for immediate handling
-                            result.append(
-                                ParsedEntry(
-                                    role="assistant",
-                                    text=summary,
-                                    content_type="tool_use",
-                                    tool_use_id=tool_id,
-                                    timestamp=entry_timestamp,
-                                    tool_name=name,
+                            # Only emit tool_use immediately for interactive tools
+                            # that need special UI handling (inline keyboards, etc.).
+                            # Background tools are deferred to tool_result stage
+                            # where they appear as collapsed expandable quotes.
+                            if name in cls._INTERACTIVE_TOOLS:
+                                result.append(
+                                    ParsedEntry(
+                                        role="assistant",
+                                        text=summary,
+                                        content_type="tool_use",
+                                        tool_use_id=tool_id,
+                                        timestamp=entry_timestamp,
+                                        tool_name=name,
+                                    )
                                 )
-                            )
                         else:
                             result.append(
                                 ParsedEntry(
@@ -618,6 +634,7 @@ class TranscriptParser:
                                 entry_text += "\n⏹ Interrupted"
                             else:
                                 entry_text = "⏹ Interrupted"
+                            entry_text = cls._format_expandable_quote(entry_text)
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -640,13 +657,13 @@ class TranscriptParser:
                                 if len(error_summary) > 100:
                                     error_summary = error_summary[:100] + "…"
                                 entry_text += f"\n  ⎿  Error: {error_summary}"
-                                # If multi-line error, add expandable quote
+                                # Include full error text (no nested quote)
                                 if "\n" in result_text:
-                                    entry_text += "\n" + cls._format_expandable_quote(
-                                        result_text
-                                    )
+                                    entry_text += "\n" + result_text
                             else:
                                 entry_text += "\n  ⎿  Error"
+                            # Wrap entire error block in expandable quote
+                            entry_text = cls._format_expandable_quote(entry_text)
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -659,7 +676,7 @@ class TranscriptParser:
                             )
                         elif tool_summary:
                             entry_text = tool_summary
-                            # For Edit tool, generate diff stats and expandable quote
+                            # For Edit tool, generate diff stats (plain, no nested quote)
                             if tool_name == "Edit" and tool_input_data and result_text:
                                 old_s = tool_input_data.get("old_string", "")
                                 new_s = tool_input_data.get("new_string", "")
@@ -679,20 +696,17 @@ class TranscriptParser:
                                             and not line.startswith("---")
                                         )
                                         stats = f"  ⎿  Added {added} lines, removed {removed} lines"
-                                        entry_text += (
-                                            "\n"
-                                            + stats
-                                            + "\n"
-                                            + cls._format_expandable_quote(diff_text)
-                                        )
-                            # For other tools, append formatted result text
+                                        entry_text += "\n" + stats + "\n" + diff_text
+                            # For other tools, append formatted result text (plain mode)
                             elif (
                                 result_text
                                 and cls.EXPANDABLE_QUOTE_START not in tool_summary
                             ):
                                 entry_text += "\n" + cls._format_tool_result_text(
-                                    result_text, tool_name
+                                    result_text, tool_name, plain=True
                                 )
+                            # Wrap entire tool block in expandable quote
+                            entry_text = cls._format_expandable_quote(entry_text)
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -704,14 +718,20 @@ class TranscriptParser:
                                 )
                             )
                         elif result_text or result_images:
+                            fallback_text = (
+                                cls._format_tool_result_text(
+                                    result_text, tool_name, plain=True
+                                )
+                                if result_text
+                                else (tool_summary or "")
+                            )
+                            fallback_text = cls._format_expandable_quote(
+                                fallback_text
+                            )
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text=cls._format_tool_result_text(
-                                        result_text, tool_name
-                                    )
-                                    if result_text
-                                    else (tool_summary or ""),
+                                    text=fallback_text,
                                     content_type="tool_result",
                                     tool_use_id=_tuid,
                                     timestamp=entry_timestamp,

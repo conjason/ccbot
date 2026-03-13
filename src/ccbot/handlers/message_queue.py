@@ -123,12 +123,8 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     if candidate.task_type != "content":
         return False
-    # tool_use/tool_result break merge chain
-    # - tool_use: will be edited later by tool_result
-    # - tool_result: edits previous message, merging would cause order issues
-    if base.content_type in ("tool_use", "tool_result"):
-        return False
-    if candidate.content_type in ("tool_use", "tool_result"):
+    # tool_use breaks merge chain (needs message_id tracking for editing)
+    if base.content_type == "tool_use" or candidate.content_type == "tool_use":
         return False
     return True
 
