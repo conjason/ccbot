@@ -100,6 +100,30 @@ _intermediate_msgs: dict[
 ] = {}
 
 
+@dataclass
+class _ConsolidationState:
+    """Accumulated state for the single collapsed process message."""
+
+    process_msg_id: int  # The ONE Telegram message holding all collapsed content
+    all_parts: list[str]  # All accumulated raw text parts (stripped of EQ markers)
+    last_update: float  # time.monotonic() of last update
+
+
+# Persistent collapsed process message per conversation.
+# Key: (user_id, thread_id_or_0, window_id)
+_consolidation_state: dict[tuple[int, int, str], _ConsolidationState] = {}
+
+# Track the last sent text message so it can be folded back into the process
+# message when the NEXT text arrives (meaning the previous text was intermediate).
+# Key: (user_id, thread_id_or_0, window_id)
+# Value: (list[telegram_msg_ids], raw_text)
+_last_text_msg: dict[tuple[int, int, str], tuple[list[int], str]] = {}
+
+# If no consolidation activity for this long, start a new chain.
+# Prevents folding a previous turn's final answer into the next turn.
+_CONSOLIDATION_TIMEOUT = 120.0  # seconds
+
+
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
     return _message_queues.get(user_id)
@@ -314,73 +338,120 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
     )
 
 
-async def _consolidate_intermediate_msgs(
-    bot: Bot, user_id: int, tid: int, wid: str, chat_id: int
-) -> None:
-    """Retroactively consolidate intermediate messages into one collapsed block.
+async def _edit_msg_with_fallback(
+    bot: Bot, chat_id: int, msg_id: int, text: str
+) -> bool:
+    """Edit a Telegram message with MarkdownV2 fallback to plain text.
 
-    Called when a final text message arrives. Edits the first intermediate
-    message with all combined content (as a single expandable quote) and
-    deletes all other intermediate messages.
+    Returns True on success, False on failure.
     """
-    ikey = (user_id, tid, wid)
-    intermediates = _intermediate_msgs.pop(ikey, None)
-    if not intermediates:
-        return
-
-    logger.debug("Consolidate: %d groups for key %s", len(intermediates), ikey)
-
-    # Collect all message IDs and raw texts
-    all_msg_ids: list[int] = []
-    combined_parts: list[str] = []
-    for msg_ids, raw_text in intermediates:
-        all_msg_ids.extend(msg_ids)
-        # Strip existing expandable quote markers to avoid nesting
-        stripped = raw_text.replace(_EQ_START, "").replace(_EQ_END, "")
-        stripped = stripped.strip()
-        if stripped:
-            combined_parts.append(stripped)
-
-    if not all_msg_ids or not combined_parts:
-        return
-
-    # Wrap all combined content in a single expandable quote
-    combined_text = _EQ_START + "\n\n".join(combined_parts) + _EQ_END
-
-    # Edit the first message with the combined collapsed content
-    first_msg_id = all_msg_ids[0]
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
-            message_id=first_msg_id,
-            text=_ensure_formatted(combined_text),
+            message_id=msg_id,
+            text=_ensure_formatted(text),
             parse_mode=PARSE_MODE,
             link_preview_options=NO_LINK_PREVIEW,
         )
+        return True
     except RetryAfter:
         raise
     except Exception:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=first_msg_id,
-                text=strip_sentinels(combined_text),
+                message_id=msg_id,
+                text=strip_sentinels(text),
                 link_preview_options=NO_LINK_PREVIEW,
             )
+            return True
         except RetryAfter:
             raise
         except Exception as e:
-            logger.debug("Failed to consolidate intermediate msgs: %s", e)
-            return  # Leave messages as-is on failure
+            logger.debug("Failed to edit msg %d: %s", msg_id, e)
+            return False
 
-    # Delete all other intermediate messages
-    for msg_id in all_msg_ids[1:]:
+
+async def _delete_msgs(bot: Bot, chat_id: int, msg_ids: list[int]) -> None:
+    """Delete a list of Telegram messages, ignoring non-critical errors."""
+    for msg_id in msg_ids:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except RetryAfter:
             raise
         except Exception as e:
-            logger.debug("Failed to delete intermediate msg %d: %s", msg_id, e)
+            logger.debug("Failed to delete msg %d: %s", msg_id, e)
+
+
+async def _consolidate_intermediate_msgs(
+    bot: Bot, user_id: int, tid: int, wid: str, chat_id: int
+) -> None:
+    """Retroactively consolidate ALL preceding messages into one collapsed block.
+
+    Called when a new text message arrives. Folds intermediate messages (tool
+    results, thinking, etc.) AND any previous assistant text messages into a
+    single expandable-quote process message. Only the newest text message
+    remains visible as the "final answer".
+
+    Uses _consolidation_state to accumulate content across multiple text
+    arrivals within the same turn, so that ALL intermediate content ends up
+    in ONE collapsed Telegram message.
+    """
+    ikey = (user_id, tid, wid)
+    now = time.monotonic()
+
+    # Pop new intermediate messages
+    intermediates = _intermediate_msgs.pop(ikey, None)
+    if not intermediates:
+        return  # Nothing to consolidate
+
+    # Check for stale consolidation state (turn boundary)
+    state = _consolidation_state.get(ikey)
+    if state and (now - state.last_update) > _CONSOLIDATION_TIMEOUT:
+        _consolidation_state.pop(ikey, None)
+        _last_text_msg.pop(ikey, None)  # Don't fold old turn's final text
+        state = None
+
+    # Also fold the previous text message (it was intermediate, not final)
+    prev_text = _last_text_msg.pop(ikey, None)
+    if prev_text:
+        # Prepend the previous text before the new intermediates
+        intermediates.insert(0, prev_text)
+
+    # Collect new message IDs and text parts
+    new_msg_ids: list[int] = []
+    new_parts: list[str] = []
+    for msg_ids, raw_text in intermediates:
+        new_msg_ids.extend(msg_ids)
+        stripped = raw_text.replace(_EQ_START, "").replace(_EQ_END, "").strip()
+        if stripped:
+            new_parts.append(stripped)
+
+    if not new_msg_ids or not new_parts:
+        return
+
+    if state:
+        # Append to existing process message
+        state.all_parts.extend(new_parts)
+        state.last_update = now
+        combined = _EQ_START + "\n\n".join(state.all_parts) + _EQ_END
+        await _edit_msg_with_fallback(bot, chat_id, state.process_msg_id, combined)
+        # Delete ALL new intermediate messages (content is now in process msg)
+        await _delete_msgs(bot, chat_id, new_msg_ids)
+    else:
+        # First consolidation — turn the first intermediate msg into process msg
+        first_msg_id = new_msg_ids[0]
+        combined = _EQ_START + "\n\n".join(new_parts) + _EQ_END
+        ok = await _edit_msg_with_fallback(bot, chat_id, first_msg_id, combined)
+        if not ok:
+            return  # Leave messages as-is on failure
+        _consolidation_state[ikey] = _ConsolidationState(
+            process_msg_id=first_msg_id,
+            all_parts=list(new_parts),
+            last_update=now,
+        )
+        # Delete other intermediate messages (first one is now the process msg)
+        await _delete_msgs(bot, chat_id, new_msg_ids[1:])
 
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -474,13 +545,19 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
 
-    # 5. Track intermediate messages for retroactive consolidation
-    if task.content_type in _INTERMEDIATE_CONTENT_TYPES and sent_ids:
+    # 5. Track messages for retroactive consolidation
+    if sent_ids:
         ikey = (user_id, tid, wid)
-        if ikey not in _intermediate_msgs:
-            _intermediate_msgs[ikey] = []
         raw_text = "\n\n".join(task.parts)
-        _intermediate_msgs[ikey].append((sent_ids, raw_text))
+        if task.content_type in _INTERMEDIATE_CONTENT_TYPES:
+            # Intermediate messages: track for consolidation on next text arrival
+            if ikey not in _intermediate_msgs:
+                _intermediate_msgs[ikey] = []
+            _intermediate_msgs[ikey].append((sent_ids, raw_text))
+        elif task.content_type == "text":
+            # Text messages: track as "last text" so it can be folded back
+            # into the process message if another text arrives later
+            _last_text_msg[ikey] = (sent_ids, raw_text)
 
     # 6. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
