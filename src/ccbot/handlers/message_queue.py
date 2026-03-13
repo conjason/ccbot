@@ -415,11 +415,6 @@ async def _consolidate_intermediate_msgs(
     ikey = (user_id, tid, wid)
     now = time.monotonic()
 
-    # Pop new intermediate messages
-    intermediates = _intermediate_msgs.pop(ikey, None)
-    if not intermediates:
-        return  # Nothing to consolidate
-
     # Check for stale consolidation state (turn boundary)
     state = _consolidation_state.get(ikey)
     if state and (now - state.last_update) > _CONSOLIDATION_TIMEOUT:
@@ -427,11 +422,24 @@ async def _consolidate_intermediate_msgs(
         _last_text_msg.pop(ikey, None)  # Don't fold old turn's final text
         state = None
 
+    # Pop new intermediate messages
+    intermediates = _intermediate_msgs.pop(ikey, None) or []
+
     # Also fold the previous text message (it was intermediate, not final)
     prev_text = _last_text_msg.pop(ikey, None)
     if prev_text:
         # Prepend the previous text before the new intermediates
         intermediates.insert(0, prev_text)
+
+    if not intermediates:
+        return  # Nothing at all to consolidate
+
+    logger.debug(
+        "Consolidate: %d groups for key %s (has_state=%s)",
+        len(intermediates),
+        ikey,
+        state is not None,
+    )
 
     # Collect new message IDs and text parts
     new_msg_ids: list[int] = []
@@ -488,6 +496,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             await _do_clear_status_message(bot, user_id, tid)
             # Join all parts for editing (merged content goes together)
             full_text = "\n\n".join(task.parts)
+            edited_ok = False
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -496,9 +505,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                await _send_task_images(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                return
+                edited_ok = True
             except RetryAfter:
                 raise
             except Exception:
@@ -511,14 +518,30 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         text=plain_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    await _send_task_images(bot, chat_id, task)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                    return
+                    edited_ok = True
                 except RetryAfter:
                     raise
                 except Exception:
                     logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
                     # Fall through to send as new message
+
+            if edited_ok:
+                # Track the edited message for retroactive consolidation.
+                # Without this, tool_result messages that edit tool_use messages
+                # would never appear in _intermediate_msgs and consolidation
+                # would skip them entirely.
+                ikey = (user_id, tid, wid)
+                if ikey not in _intermediate_msgs:
+                    _intermediate_msgs[ikey] = []
+                _intermediate_msgs[ikey].append(([edit_msg_id], full_text))
+                logger.debug(
+                    "Tracked edited tool_result msg %d for consolidation (key=%s)",
+                    edit_msg_id,
+                    ikey,
+                )
+                await _send_task_images(bot, chat_id, task)
+                await _check_and_send_status(bot, user_id, wid, task.thread_id)
+                return
 
     # 2. Send content messages, converting status message to first content part
     first_part = True
@@ -569,10 +592,17 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             if ikey not in _intermediate_msgs:
                 _intermediate_msgs[ikey] = []
             _intermediate_msgs[ikey].append((sent_ids, raw_text))
+            logger.debug(
+                "Track intermediate: type=%s, ids=%s, key=%s",
+                task.content_type,
+                sent_ids,
+                ikey,
+            )
         elif task.content_type == "text":
             # Text messages: track as "last text" so it can be folded back
             # into the process message if another text arrives later
             _last_text_msg[ikey] = (sent_ids, raw_text)
+            logger.debug("Track last_text: ids=%s, key=%s", sent_ids, ikey)
 
     # 6. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
