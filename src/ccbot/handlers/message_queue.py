@@ -328,6 +328,8 @@ async def _consolidate_intermediate_msgs(
     if not intermediates:
         return
 
+    logger.debug("Consolidate: %d groups for key %s", len(intermediates), ikey)
+
     # Collect all message IDs and raw texts
     all_msg_ids: list[int] = []
     combined_parts: list[str] = []
@@ -368,7 +370,7 @@ async def _consolidate_intermediate_msgs(
         except RetryAfter:
             raise
         except Exception as e:
-            logger.debug(f"Failed to consolidate intermediate msgs: {e}")
+            logger.debug("Failed to consolidate intermediate msgs: %s", e)
             return  # Leave messages as-is on failure
 
     # Delete all other intermediate messages
@@ -378,7 +380,7 @@ async def _consolidate_intermediate_msgs(
         except RetryAfter:
             raise
         except Exception as e:
-            logger.debug(f"Failed to delete intermediate msg {msg_id}: {e}")
+            logger.debug("Failed to delete intermediate msg %d: %s", msg_id, e)
 
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
