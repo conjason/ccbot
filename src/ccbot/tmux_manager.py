@@ -421,7 +421,9 @@ class TmuxManager:
                         cmd = config.claude_command
                         if resume_session_id:
                             cmd = f"{cmd} --resume {resume_session_id}"
-                        pane.send_keys(cmd, enter=True)
+                        # Unset CLAUDECODE to prevent "nested session" error
+                        # when the tmux env inherits it from a parent session
+                        pane.send_keys(f"unset CLAUDECODE && {cmd}", enter=True)
 
                 logger.info(
                     "Created window '%s' (id=%s) at %s",

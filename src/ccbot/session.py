@@ -53,6 +53,7 @@ class WindowState:
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    pinned_session_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -61,6 +62,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.pinned_session_id:
+            d["pinned_session_id"] = self.pinned_session_id
         return d
 
     @classmethod
@@ -69,6 +72,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            pinned_session_id=data.get("pinned_session_id", ""),
         )
 
 
@@ -191,6 +195,66 @@ class SessionManager:
                 self.group_chat_ids = {}
                 pass
 
+    def _write_session_map_placeholder(
+        self, window_id: str, session_id: str, cwd: str, window_name: str
+    ) -> None:
+        """Write a placeholder entry to session_map.json for a restored window.
+
+        Prevents load_session_map() from cleaning up the window_state before
+        the Claude Code SessionStart hook fires with the real entry.
+        """
+        session_map: dict[str, Any] = {}
+        if config.session_map_file.exists():
+            try:
+                session_map = json.loads(config.session_map_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        key = f"{config.tmux_session_name}:{window_id}"
+        session_map[key] = {
+            "session_id": session_id,
+            "cwd": cwd,
+            "window_name": window_name,
+        }
+        atomic_write_json(config.session_map_file, session_map)
+
+    async def _restore_stale_window(
+        self, old_window_id: str, ws: WindowState, display_name: str
+    ) -> str | None:
+        """Attempt to restore a stale tmux window by creating a new one with --resume.
+
+        Returns new window_id on success, None on failure.
+        """
+        if not ws.cwd or not Path(ws.cwd).is_dir():
+            logger.info("Cannot restore %s: cwd missing (%s)", old_window_id, ws.cwd)
+            return None
+
+        session_file = self._build_session_file_path(ws.session_id, ws.cwd)
+        if not session_file or not session_file.exists():
+            logger.info("Cannot restore %s: session file missing", old_window_id)
+            return None
+
+        success, msg, wname, new_wid = await tmux_manager.create_window(
+            ws.cwd, window_name=display_name, resume_session_id=ws.session_id
+        )
+        if not success:
+            logger.warning("Failed to restore window %s: %s", old_window_id, msg)
+            return None
+
+        # Write placeholder to session_map.json so load_session_map() doesn't
+        # clean up this window_state before the hook fires.
+        self._write_session_map_placeholder(
+            new_wid, ws.session_id, ws.cwd, display_name
+        )
+
+        logger.info(
+            "Restored window: %s -> %s (name=%s, session=%s)",
+            old_window_id,
+            new_wid,
+            display_name,
+            ws.session_id,
+        )
+        return new_wid
+
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
 
@@ -208,6 +272,7 @@ class SessionManager:
             live_ids.add(w.window_id)
 
         changed = False
+        restored_id_map: dict[str, str] = {}  # old_window_id -> new_window_id
 
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
@@ -232,10 +297,38 @@ class SessionManager:
                         self.window_display_names.pop(key, None)
                         changed = True
                     else:
-                        logger.info(
-                            "Dropping stale window_state: %s (name=%s)", key, display
+                        # Only restore if a thread binding references this window;
+                        # orphaned windows (no topic) aren't worth recreating.
+                        has_binding = any(
+                            wid == key
+                            for bindings in self.thread_bindings.values()
+                            for wid in bindings.values()
                         )
-                        changed = True
+                        if not has_binding:
+                            logger.info(
+                                "Dropping stale window_state: %s (name=%s, no binding)",
+                                key,
+                                display,
+                            )
+                            changed = True
+                            continue
+                        # No live window matches — attempt to restore
+                        new_id = await self._restore_stale_window(key, ws, display)
+                        if new_id:
+                            ws.pinned_session_id = ws.session_id
+                            new_window_states[new_id] = ws
+                            ws.window_name = display
+                            self.window_display_names[new_id] = display
+                            self.window_display_names.pop(key, None)
+                            restored_id_map[key] = new_id
+                            changed = True
+                        else:
+                            logger.info(
+                                "Dropping stale window_state: %s (name=%s)",
+                                key,
+                                display,
+                            )
+                            changed = True
             else:
                 # Old format: key is window_name
                 new_id = live_by_name.get(key)
@@ -261,7 +354,7 @@ class SessionManager:
                         new_bindings[tid] = val
                     else:
                         display = self.window_display_names.get(val, val)
-                        new_id = live_by_name.get(display)
+                        new_id = restored_id_map.get(val) or live_by_name.get(display)
                         if new_id:
                             logger.info(
                                 "Re-resolved thread binding %s -> %s (name=%s)",
@@ -312,7 +405,7 @@ class SessionManager:
                         new_offsets[key] = offset
                     else:
                         display = self.window_display_names.get(key, key)
-                        new_id = live_by_name.get(display)
+                        new_id = restored_id_map.get(key) or live_by_name.get(display)
                         if new_id:
                             new_offsets[new_id] = offset
                             changed = True
@@ -331,8 +424,11 @@ class SessionManager:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
+        # Include restored window IDs so cleanup doesn't remove their placeholders
+        all_live_ids = live_ids | set(restored_id_map.values())
+
         # Clean up session_map.json: stale window IDs and old-format keys
-        await self._cleanup_stale_session_map_entries(live_ids)
+        await self._cleanup_stale_session_map_entries(all_live_ids)
         await self._cleanup_old_format_session_map_keys()
 
     async def _cleanup_old_format_session_map_keys(self) -> None:
@@ -531,6 +627,19 @@ class SessionManager:
             if not new_sid:
                 continue
             state = self.get_window_state(window_id)
+            # When pinned_session_id is set (restored --resume window), the
+            # hook will report a new session_id.  Override it back to the
+            # original so the monitor can find the JSONL file.
+            if state.pinned_session_id and new_sid != state.pinned_session_id:
+                logger.info(
+                    "Pinned override: window %s session_id %s -> %s",
+                    window_id,
+                    new_sid,
+                    state.pinned_session_id,
+                )
+                new_sid = state.pinned_session_id
+                state.pinned_session_id = ""  # One-shot: unpin after override
+                changed = True
             if state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
                     "Session map: window_id %s updated sid=%s, cwd=%s",

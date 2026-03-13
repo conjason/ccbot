@@ -19,7 +19,12 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+SENSITIVE_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_USERS",
+    "OPENAI_API_KEY",
+    "CLAUDECODE",  # Prevent "nested session" error in Claude Code
+}
 
 
 class Config:
