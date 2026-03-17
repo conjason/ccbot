@@ -203,7 +203,9 @@ class SessionMonitor:
         """
         new_entries = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            async with aiofiles.open(
+                file_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 # Get file size to detect truncation
                 await f.seek(0, 2)  # Seek to end
                 file_size = await f.tell()
@@ -262,8 +264,13 @@ class SessionMonitor:
 
                 session.last_byte_offset = safe_offset
 
-        except OSError as e:
-            logger.error("Error reading session file %s: %s", file_path, e)
+        except (OSError, UnicodeDecodeError) as e:
+            logger.error(
+                "Error reading session file %s (offset=%d): %s",
+                file_path,
+                session.last_byte_offset,
+                e,
+            )
         return new_entries
 
     async def check_for_updates(self, active_session_ids: set[str]) -> list[NewMessage]:
@@ -396,8 +403,12 @@ class SessionMonitor:
                     session_id = info.get("session_id", "")
                     if session_id:
                         window_to_session[window_key] = session_id
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    "Failed to parse session_map.json, returning last known map: %s",
+                    e,
+                )
+                return dict(self._last_session_map)
         return window_to_session
 
     async def _cleanup_all_stale_sessions(self) -> None:
@@ -501,10 +512,15 @@ class SessionMonitor:
                         try:
                             await self._message_callback(msg)
                         except Exception as e:
-                            logger.error(f"Message callback error: {e}")
+                            logger.error(
+                                "Message callback error (session=%s): %s",
+                                msg.session_id,
+                                e,
+                                exc_info=True,
+                            )
 
             except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
+                logger.error("Monitor loop error: %s", e, exc_info=True)
 
             await asyncio.sleep(self.poll_interval)
 

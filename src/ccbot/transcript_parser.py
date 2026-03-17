@@ -95,7 +95,9 @@ class TranscriptParser:
 
         try:
             return json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            preview = line[:120] + ("..." if len(line) > 120 else "")
+            logger.warning("JSONL parse error: %s | line: %s", e, preview)
             return None
 
     @staticmethod
@@ -725,9 +727,7 @@ class TranscriptParser:
                                 if result_text
                                 else (tool_summary or "")
                             )
-                            fallback_text = cls._format_expandable_quote(
-                                fallback_text
-                            )
+                            fallback_text = cls._format_expandable_quote(fallback_text)
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
