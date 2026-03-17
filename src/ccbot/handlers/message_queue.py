@@ -95,9 +95,7 @@ _EQ_END = "\x02EXPQUOTE_END\x02"
 # Track intermediate messages for retroactive consolidation when final text arrives.
 # Key: (user_id, thread_id_or_0, window_id)
 # Value: list of (list[telegram_message_id], raw_text_before_markdown)
-_intermediate_msgs: dict[
-    tuple[int, int, str], list[tuple[list[int], str]]
-] = {}
+_intermediate_msgs: dict[tuple[int, int, str], list[tuple[list[int], str]]] = {}
 
 
 @dataclass
@@ -319,14 +317,31 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     )
                     await asyncio.sleep(retry_secs)
             except Exception as e:
-                logger.error(f"Error processing message task for user {user_id}: {e}")
+                logger.error(
+                    "Error processing message task for user %d: %s",
+                    user_id,
+                    e,
+                    exc_info=True,
+                )
             finally:
                 queue.task_done()
         except asyncio.CancelledError:
             logger.info(f"Message queue worker cancelled for user {user_id}")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
+            logger.error(
+                "Unexpected error in queue worker for user %d "
+                "(task_done not called, queue may stall): %s",
+                user_id,
+                e,
+                exc_info=True,
+            )
+            # Ensure task_done is called even for outer exceptions
+            # to prevent the queue from stalling
+            try:
+                queue.task_done()
+            except ValueError:
+                pass  # task_done called more times than get
 
 
 def _send_kwargs(thread_id: int | None) -> dict[str, int]:

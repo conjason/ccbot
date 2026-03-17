@@ -207,8 +207,12 @@ class SessionManager:
         if config.session_map_file.exists():
             try:
                 session_map = json.loads(config.session_map_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    "Failed to read session_map.json for placeholder write, "
+                    "starting fresh: %s",
+                    e,
+                )
         key = f"{config.tmux_session_name}:{window_id}"
         session_map[key] = {
             "session_id": session_id,
@@ -439,7 +443,10 @@ class SessionManager:
             async with aiofiles.open(config.session_map_file, "r") as f:
                 content = await f.read()
             session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "Failed to parse session_map.json for old-key cleanup: %s", e
+            )
             return
 
         prefix = f"{config.tmux_session_name}:"
@@ -471,7 +478,8 @@ class SessionManager:
             async with aiofiles.open(config.session_map_file, "r") as f:
                 content = await f.read()
             session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to parse session_map.json for stale cleanup: %s", e)
             return
 
         prefix = f"{config.tmux_session_name}:"
@@ -584,8 +592,12 @@ class SessionManager:
                         )
                         await self.load_session_map()
                         return True
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                logger.debug(
+                    "session_map parse error while polling for %s (will retry): %s",
+                    window_id,
+                    e,
+                )
             await asyncio.sleep(interval)
         logger.warning(
             "Timed out waiting for session_map entry: window_id=%s", window_id
@@ -606,7 +618,10 @@ class SessionManager:
             async with aiofiles.open(config.session_map_file, "r") as f:
                 content = await f.read()
             session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "Failed to parse session_map.json in load_session_map: %s", e
+            )
             return
 
         prefix = f"{config.tmux_session_name}:"
@@ -916,6 +931,18 @@ class SessionManager:
             resolved = await self.resolve_session_for_window(window_id)
             if resolved and resolved.session_id == session_id:
                 result.append((user_id, window_id, thread_id))
+        if not result:
+            logger.debug(
+                "find_users_for_session: no bindings match session_id=%s "
+                "(total_bindings=%d, window_states=%s)",
+                session_id,
+                sum(len(t) for t in self.thread_bindings.values()),
+                {
+                    wid: ws.session_id
+                    for wid, ws in self.window_states.items()
+                    if ws.session_id
+                },
+            )
         return result
 
     # --- Tmux helpers ---

@@ -974,6 +974,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
+        logger.warning(
+            "send_to_window failed: window=%s, user=%d, reason=%s",
+            wid,
+            user.id,
+            message,
+        )
         await safe_reply(update.message, f"❌ {message}")
         return
 
