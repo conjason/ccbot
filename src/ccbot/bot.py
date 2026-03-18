@@ -35,6 +35,7 @@ Key functions: create_bot(), handle_new_message().
 import asyncio
 import io
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -1888,14 +1889,19 @@ async def post_shutdown(application: Application) -> None:
 
 
 def create_bot() -> Application:
-    application = (
+    builder = (
         Application.builder()
         .token(config.telegram_bot_token)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .build()
     )
+    # Apply proxy from environment if set (needed for Telegram API access)
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy_url:
+        builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+        logger.info("Telegram bot using proxy: %s", proxy_url)
+    application = builder.build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
