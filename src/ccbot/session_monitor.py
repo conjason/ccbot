@@ -91,42 +91,6 @@ class SessionMonitor:
     ) -> None:
         self._message_callback = callback
 
-    MAX_CONTEXT_TOKENS = 1_000_000  # Claude Opus 4.6
-
-    async def _get_context_from_statusline(self, window_id: str) -> str:
-        """Capture tmux pane and extract token count from Claude Code statusline.
-
-        The statusline (configured via settings.json) outputs something like:
-          "69535 tokens" or "69535 tokens | ctx: 93% remaining"
-        We parse the token count and compute context usage percentage.
-        Returns a formatted string like "\\n\\n🟢 Context: 7% used (69,535 tokens)"
-        or "" if not found.
-        """
-        try:
-            pane_text = await tmux_manager.capture_pane(window_id)
-            if not pane_text:
-                return ""
-            # Search last 5 lines for token count pattern
-            lines = pane_text.strip().splitlines()
-            for line in reversed(lines[-5:]):
-                m = re.search(r"(\d[\d,]*)\s*tokens", line)
-                if m:
-                    total = int(m.group(1).replace(",", ""))
-                    pct = min(round(total / self.MAX_CONTEXT_TOKENS * 100), 100)
-                    if pct >= 80:
-                        icon = "🔴"
-                    elif pct >= 50:
-                        icon = "🟡"
-                    else:
-                        icon = "🟢"
-                    return (
-                        f"\n\n{icon} Context: {pct}% used "
-                        f"({total:,}/{self.MAX_CONTEXT_TOKENS:,} tokens)"
-                    )
-        except Exception as e:
-            logger.debug("Failed to read statusline for %s: %s", window_id, e)
-        return ""
-
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
         cwds = set()
@@ -229,6 +193,37 @@ class SessionMonitor:
                 logger.debug(f"Error scanning jsonl files in {project_dir}: {e}")
 
         return sessions
+
+    @staticmethod
+    async def _extract_context_from_statusline(window_id: str) -> str:
+        """Extract token count from Claude Code's statusLine via tmux capture.
+
+        Reads the tmux pane content and looks for the statusLine output
+        which shows total tokens (e.g. "69535 tokens"). Returns a formatted
+        context string or "" if not found.
+
+        Claude Opus 4.6 has a 1M token context window.
+        """
+        MAX_CONTEXT_TOKENS = 1_000_000
+        try:
+            pane_text = await tmux_manager.capture_pane(window_id)
+            if not pane_text:
+                return ""
+            # StatusLine shows "NNNNN tokens" in the bottom area
+            match = re.search(r"(\d+)\s+tokens", pane_text)
+            if not match:
+                return ""
+            total = int(match.group(1))
+            pct = min(round(total / MAX_CONTEXT_TOKENS * 100), 100)
+            if pct >= 80:
+                icon = "🔴"
+            elif pct >= 50:
+                icon = "🟡"
+            else:
+                icon = "🟢"
+            return f"\n\n{icon} Context: {pct}% used ({total:,}/{MAX_CONTEXT_TOKENS:,} tokens)"
+        except Exception:
+            return ""
 
     async def _read_new_lines(
         self, session: TrackedSession, file_path: Path
@@ -389,15 +384,13 @@ class SessionMonitor:
                 else:
                     self._pending_tools.pop(session_info.session_id, None)
 
-                # Collect messages from this session
-                session_messages: list[NewMessage] = []
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
-                    session_messages.append(
+                    new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,
                             text=entry.text,
@@ -410,28 +403,28 @@ class SessionMonitor:
                         )
                     )
 
-                # Append context usage from statusline to last assistant text
-                if session_messages:
-                    # Find window_id for this session from session_map
-                    window_id = None
+                # Append context usage % from statusLine to last assistant text
+                if new_messages:
+                    # Reverse-lookup window_id from session_id
+                    wid = None
                     for wkey, sid in self._last_session_map.items():
                         if sid == session_info.session_id:
-                            window_id = wkey
+                            wid = wkey.split(":")[-1] if ":" in wkey else wkey
                             break
-                    if window_id:
-                        ctx = await self._get_context_from_statusline(window_id)
+                    if wid:
+                        ctx = await self._extract_context_from_statusline(wid)
                         if ctx:
-                            # Append to last assistant text message
-                            for i in range(len(session_messages) - 1, -1, -1):
+                            for i in range(len(new_messages) - 1, -1, -1):
                                 if (
-                                    session_messages[i].role == "assistant"
-                                    and session_messages[i].content_type == "text"
-                                    and session_messages[i].text
+                                    new_messages[i].role == "assistant"
+                                    and new_messages[i].content_type == "text"
+                                    and new_messages[i].text
+                                    and new_messages[i].session_id
+                                    == session_info.session_id
                                 ):
-                                    session_messages[i].text += ctx
+                                    new_messages[i].text += ctx
                                     break
 
-                new_messages.extend(session_messages)
                 self.state.update_session(tracked)
 
             except OSError as e:
